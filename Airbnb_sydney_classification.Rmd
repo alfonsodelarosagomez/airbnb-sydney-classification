@@ -1,0 +1,1102 @@
+---
+title: "Airbnb Sydney Dataset Analysis"
+author: "Alfonso De La Rosa Gomez"
+date: "31/05/2026"
+output:
+  html_document:
+    code_folding: hide
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: 3
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+```{r setup, include=FALSE}
+# Show code only for HTML, hide for PDF and Word
+knitr::opts_chunk$set(
+  echo = knitr::is_html_output(),
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(missForest)
+library(leaflet)
+library(cowplot)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(doParallel)
+
+```
+# 1. Problem Overview  
+
+## 1.1 Background and Motivation  
+Short-term rentals, especially Airbnb listings, play a significant role in Sydney's housing affordability and tourism market. Understanding how various property features affect rental prices is crucial for both landlords and travellers. This issue is highly relevant to Sydney. Short-term rentals have become a major problem affecting housing affordability, tourism dynamics and the city's economy.
+By identifying the key factors of rental prices, this study provides useful data-driven insights for policymakers, urban planners, real estate managers, and tenants.
+
+## 1.2 Objectives and Research Questions
+The aim of this project is to categorise short-term rental properties in Sydney into three price ranges based on characteristics such as location, number of bedrooms and property type: budget (under $150), mid-range ($150 to $349) and luxury ($350 and above). Instead of predicting the exact rental price, each property was classified into one of these predefined groups and the task was constructed as a multi-class classification problem with the result variable "price_category". This study attempts to answer the question: What factors determine the price categories of Airbnb listings in Sydney?
+
+## 1.3 Broader impact
+This project not only regards price forecasting as a classification problem, but also places it in the broader context of the Sydney real estate market, thereby enabling a data-driven understanding of affordability and tourism trends. Furthermore, this work also demonstrates how machine learning classification can be applied to real-world social and economic challenges in Australia (CBRE, 2024; Airbtics, 2025).
+
+# 2. Data description
+
+## 2.1 Data Source  
+The dataset was obtained from Inside Airbnb ([https://insideairbnb.com/get-the-data/](https://insideairbnb.com/get-the-data/)), using the Sydney listings snapshot from June 2025. Inside Airbnb is an independent open-data project that publishes publicly available Airbnb listings data worldwide, widely used in academic and policy research related to housing, tourism and urban analytics (Inside Airbnb, 2025).
+
+## 2.2 Dataset Description
+
+The dataset was first ingested and recorded as a dataframe. Afterwards, the size, data type, and a head of the dataset were validated to provide a better understanding of the data. In detail, the dataset contains 18,187 records of Airbnb listings in Sydney with 79 variables. In addition, the data types include: character (35), integer (27), numeric (15), logical (2). Preliminary inspection shows that the dataset is sufficiently large for building machine learning models, though there is a substantial amount of missing values.
+
+```{r}
+#Read the dataset
+airbnb <- read.csv("listings.csv")
+
+#Dataset size
+num_rows <- nrow(airbnb) #Number of samples
+num_cols <- ncol(airbnb) #Number of variables
+
+#Check variable types
+var_types <- sapply(airbnb, class)
+type_summary <- table(var_types) #record with the number of var_types
+
+#Calculate missing values percentage
+missing_info <- colSums(is.na(airbnb))
+missing_percent <- round(missing_info / num_rows * 100, 2)
+
+##Create a table of top 5 variables with highest missing values
+missing_airbnb <- data.frame(
+  Variable = names(missing_info),
+  MissingPercent = missing_percent
+) %>%
+  arrange(desc(MissingPercent)) %>%
+  head(5)
+
+##Display result (if needed)
+##missing_airbnb
+
+
+#Data understanding
+##glimp: recorded in the glimpse_otucome variable.
+glimpse_outcome <- capture.output(dplyr::glimpse(airbnb, width = 120))
+
+##head: recorded in the head_outcome
+head_outcome<-head(airbnb,4)
+
+```
+## 2.3 Outcome Variable
+
+The target variable **`price_category`** was derived from the original `price` field by grouping listings into:
+
+| Category  | Price Range (AUD) | Percentage |
+|------------|------------------:|------------:|
+| Budget     | 0 to 149          | 29% |
+| Mid-range  | 150 to 349        | 48% |
+| Luxury     | 350+              | 23% |
+
+This conversion converts continuous numerical variables into interpretable classification results suitable for multi-class classification modelling. These thresholds were selected based on the average daily rate (ADR) of approximately $240 to $260 in Sydney (CBRE Hotel Research, 2024). The sub-ADR cut-off value of nearly $150 covers hotel-level listings, while the upper cut-off value of over $350 is in line with the high-end segment reported by Airbtics (2025). This ensures a balanced class distribution while maintaining the interpretability of the real world.
+
+This transformation converts the continuous `price` variable into a categorical target (price_category) suitable for a **multi-class classification task**.  
+```{r}
+#Convert price column to numeric (remove $ and ,)
+airbnb$price <- as.numeric(gsub("[$,]", "", airbnb$price))
+
+#Create target variable: price_category
+airbnb$price_category <- cut(
+  airbnb$price,
+  breaks = c(-Inf, 150, 350, Inf),
+  right = FALSE,  # means [lower, upper)
+  labels = c("Budget", "Mid-range", "Luxury")
+)
+
+#Check distribution of target variable (if needed)
+#table(airbnb$price_category)
+
+#Show class distribution with percentages (if needed)
+#prop.table(table(airbnb$price_category)) * 100
+```
+
+## 2.4 Dataset Challenges
+
+While the dataset is rich and informative, several challenges need to be addressed before modelling:
+
+- **Missing Values**
+Some variables have a substantial proportion of missing values (over 15%), which will require either removal or imputation strategies.
+- **High Dimensionality**
+The dataset contains nearly 80 variables, including both numerical and categorical features. Careful feature selection or dimensionality reduction may be needed.
+- **Outliers in Price**
+Price distribution is highly skewed, with extreme outliers in the luxury segment. These need to be treated to prevent bias in classification.
+- **Mixed Data Types**
+The dataset includes numerical variables (e.g., price, bathroom), categorical variables (e.g., room_type, property_type), and text-based variables (e.g., description, neighbourhood_overview). Some text-heavy variables may not be directly usable without advanced processing (e.g., Natural Language Processing).
+- **Class Imbalance**
+The number of listings in each price category may not be balanced, potentially requiring resampling techniques.
+
+Therefore, this dataset meets the conditions for large size, messiness and multi-class classification.
+
+# 3. Data cleaning and Preparation
+
+The data cleaning process involved four main steps: validating the percentage of missing values, dropping unnecessary columns, standardising data formats, and analysing extreme values.
+
+After the initial data inspection, no duplicate rows were found. A total of 18 columns contained missing values, including neighbourhood_group_cleansed and calendar_updated, which had 100% missing data. All review-related columns (e.g., review_scores_accuracy, review_scores_value) showed approximately 17.5% missingness, while most of the remaining features had around 13% missing data.
+
+```{r}
+
+#Check for duplicate rows and IDs
+duplicate_rows <- airbnb %>% duplicated()
+
+#Columns with missing values
+high_missing <- airbnb %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "percent_missing") %>%
+  filter(percent_missing > 0) %>%
+  arrange(desc(percent_missing))
+
+#recorded in high_missing variable to be imputed in later steps
+
+#Summary of columns:
+#neighbourhood_group_cleansed: 100%
+#calendar_updated: 100%
+#review_scores_accuracy: 17.49%
+#review_scores_checkin: 17.49%
+#review_scores_location: 17.49%
+#review_scores_value: 17.49%
+#review_scores_cleanliness: 17.49%
+#review_scores_communication: 17.49%
+#review_scores_rating: 17.48%
+#reviews_per_month: 17.48%
+#beds: 13.71%
+#bathrooms: 13.52%
+#price: 13.49%
+#estimated_revenue_l365d: 13.49%
+#price_category: 13.49%
+#bedrooms: 2.40%
+#host_listings_count: 0.03%
+#host_total_listings_count: 0.03%
+
+```
+
+Secondly, columns were dropped: Columns that had 100% of records missing (i.e., neighbourhood_group_cleansed,calendar_updated), along with columns with links (e.g., listing_url, host_url) and long descriptions that require advanced methods like Natural Language Processing (e.g., description, neighborhood_overview). In addition, the columns regarding the web scraping method used (last_scraped, calendar_last_scraped, scrape_id, source) were deleted due to their redundancy.
+
+```{r}
+#columns to drop
+
+#Define columns to drop
+##Row 1: Columns with 100% missing values, Row 2: Columns containing links, Row 3: Columns with long text descriptions, Last Row: Columns related to web scraping metadata.
+columns_to_drop <- c(
+  "neighbourhood_group_cleansed","calendar_updated",
+  "listing_url", "picture_url","host_url","host_thumbnail_url", "host_picture_url",
+  "name","description", "neighborhood_overview","host_about","host_name","neighbourhood","license","host_location", "host_neighbourhood", "host_verifications", "amenities",
+  "scrape_id","last_scraped","source","calendar_last_scraped")
+
+##Drop the columns and copy df into a new variable.
+df <- airbnb %>%
+  select(-all_of(columns_to_drop))
+```
+
+Thirdly, data formats were standardised for consistency. Date fields (i.e., host_since, first_review, last_review) were parsed to dates, and "N/A" placeholders in percentage columns were set to missing before conversion to numeric. Boolean flags (i.e., host_is_superhost, host_has_profile_pic, host_identity_verified, has_availability, instant_bookable) were mapped to logicals. The bathrooms column was imputed using the numerical information extracted from bathrooms_text. Categorical fields (e.g., property_type, room_type) were retained for later One-Hot encoding.
+
+```{r}
+
+#Identify inconsistent formats (dates, strings, units)
+missing_pct <- sapply(df, function(x) mean(is.na(x)) * 100)
+dtypes <- sapply(df, class)
+
+##Combine dtype and missing percentage into one data frame
+summary <- data.frame(
+  dtype = dtypes,
+  missing_pct = missing_pct
+)
+
+##Analysis: proposed new data types.
+## host_since = Date
+## host_response_time = factor (categorical: "within an hour", "within a day", etc.)
+## host_acceptance_rate = numeric (percentage)
+## host_is_superhost = logical
+## host_listings_count = integer
+## host_total_listings_count = integer
+## host_verifications = character (later one-hot encoding)
+## host_has_profile_pic = logical
+## host_identity_verified = logical
+## amenities = character (later one-hot encoding)
+## price = numeric (remove $ and ,)
+## has_availability = logical
+## first_review = Date
+## last_review = Date
+## instant_bookable = logical
+
+#Convert Data columns:
+df <- df %>%
+  mutate(
+    #Convert date columns
+    host_since   = lubridate::ymd(host_since),
+    first_review = lubridate::ymd(first_review),
+    last_review  = lubridate::ymd(last_review),
+
+    #Replace "N/A" with NA before type conversion
+    host_response_rate   = na_if(host_response_rate, "N/A"),
+    host_acceptance_rate = na_if(host_acceptance_rate, "N/A"),
+
+    #Convert response time and acceptance rate
+    host_response_time   = factor(host_response_time),
+    host_response_rate   = readr::parse_number(host_response_rate),
+    host_acceptance_rate = readr::parse_number(host_acceptance_rate),
+
+    #Convert to logical (boolean)
+    host_is_superhost      = host_is_superhost == "t",
+    host_has_profile_pic   = host_has_profile_pic == "t",
+    host_identity_verified = host_identity_verified == "t",
+    has_availability       = has_availability == "t",
+    instant_bookable       = instant_bookable == "t",
+
+    #Impute bathrooms from bathrooms_text
+    bathrooms_num_from_text = readr::parse_number(bathrooms_text),
+    bathrooms = if_else(is.na(bathrooms) & !is.na(bathrooms_num_from_text),
+                        bathrooms_num_from_text, bathrooms),
+
+    #Force "Shared half-bath" to 0.5
+    bathrooms = if_else(
+      stringr::str_detect(bathrooms_text, regex("shared half-bath", ignore_case = TRUE)),
+      0.5,
+      bathrooms
+    ),
+
+    #Clean bathrooms_text to keep only type words
+    bathrooms_text = bathrooms_text %>%
+      tolower() %>%
+      stringr::str_replace_all("^\\s*\\d+(?:\\.\\d+)?\\s*", "") %>%
+      stringr::str_replace_all("\\bshared bathroom\\b", "shared bath") %>%
+      stringr::str_replace_all("\\bprivate bathroom\\b", "private bath") %>%
+      stringr::str_replace_all("\\bbaths\\b", "bath") %>%
+      stringr::str_squish() %>%
+      na_if("")
+  ) %>%
+  #Drop helper column and host_name explicitly
+  select(-bathrooms_num_from_text)
+
+##head(df) to visualise the first 5 records
+
+```
+Fourthly, some findings when analysing outliers:
+
+* The highest outlier in the bathrooms field is for a hostel with more than 21 bathrooms. On the website, it was listed as a shared room, not an entire home.
+
+* The further outlier for the price column is at $20,000, which is a single couch being rented in a shared-room. Likely to be a mistake rather than the average price at this range.
+
+* The only extreme outlier in minimum_maximum_nights, maximum_maximum_nights and maximum_nights_avg_ntm is the same recorded value at 9,999 for all 3 columns, which is far away from any previous value in these features (around 1,500-2,000).
+
+These three records were deleted as they represent data entry or validity errors rather than genuine observations. Removing these records helps preserve the dataset’s reliability and prevents distortion of statistical summaries and model training.
+
+```{r outliers, fig.width=8, fig.height=3}
+#Boxplot for each quantitative column
+
+##Select only numeric (quantitative) columns
+numeric_cols <- df %>% select(where(is.numeric)) %>% colnames()
+
+##Create the plot and store them in a list, to avoid prim them all.
+plots <- map(numeric_cols, function(col) {
+  ggplot(df, aes(x = "", y = .data[[col]])) +
+    geom_boxplot(fill = "steelblue") +
+    coord_flip() +
+    labs(title = paste("Boxplot of", col),
+         x = "",
+         y = col) +
+    theme_minimal()
+})
+
+#Print only needed plots
+bathrooms_plot=plots[[10]]
+price_plot=plots[[13]]
+minimum_maximum_nights_plot=plots[[18]]
+maximum_maximum_nights_plot=plots[[19]]
+
+#Combine the four plots into a 2x2 layout
+combined_plot <- (bathrooms_plot + price_plot) /
+                 (minimum_maximum_nights_plot + maximum_maximum_nights_plot)
+
+#Add a global title
+combined_plot + plot_annotation(title = "Figure 1 - Boxplots of Selected Variables")
+```
+
+
+```{r}
+
+#Remove extreme values
+
+#1. Remove listing with unrealistic number of bathrooms (>20)
+df <- df %>%
+  filter(bathrooms <= 20 | is.na(bathrooms))
+
+#2. Remove record with extreme price outlier ($20,000)
+df <- df %>%
+  filter(price < 20000 | is.na(price))
+
+#3. Remove records with placeholder values (9,999) in night limits
+df <- df %>%
+  filter(
+    maximum_nights_avg_ntm < 9999 | is.na(maximum_nights_avg_ntm),
+    maximum_maximum_nights < 9999 | is.na(maximum_maximum_nights),
+    minimum_maximum_nights < 9999 | is.na(minimum_maximum_nights)
+  )
+
+
+```
+
+
+# 4. Exploration and Visualisation
+
+A central step is to perform an exploratory data Analysis (EDA) to unearth preliminary patterns in the Sydney Airbnb dataset through visualisation. Then, discover patterns of key variables in addition to concrete relationships that exist within the data. The exploration will have an overview of price distribution, geographical concentration, and the importance of property factors, which are significant to the further analysis and modelling. The next few plots try to capture the significant features of data.
+
+
+```{r price_roomtype, fig.width=10, fig.height=4}
+
+ggplot(df, aes(room_type, price, fill = room_type)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  coord_cartesian(ylim = c(0, 1000)) +
+  scale_y_continuous() +
+  labs(title = "Figure 2: Price by room type ", x = "Room type", y = "Price (AUD)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+The boxplot in Figure 2 represents the market structure by room type. Unsurprisingly, 'Entire home/apt' has the highest median price and the most spread, including from flats to mansions on offer. 'Shared room' is the cheapest and the most budget friendly option. There are numerous high-priced outliers, particularly for ‘Entire home/apt’ and ‘Private room’. Although the median prices for these categories are relatively modest, the presence of these outliers indicates that certain listings in this range can drive significantly higher rates.
+
+```{r price_distribution, fig.width=10, fig.height=4}
+
+#Prepare data: clean price values, create price categories, and convert to factors
+df <- df %>%
+  mutate(
+    price_num = as.numeric(gsub("[$,]", "", price)),
+    price_category = case_when(
+      price_num < 150 ~ "0–149",
+      price_num >= 150 & price_num < 350 ~ "150–349",
+      price_num >= 350 ~ "350+",
+      TRUE ~ NA_character_
+    ),
+    # make levels explicit so the scale matches exactly
+    price_category = factor(price_category, levels = c("0–149", "150–349", "350+"))
+  )
+
+#Plot Figure 3: bar chart showing number of listings by price category
+listing <- ggplot(df, aes(x = price_category, fill = price_category)) +
+  geom_bar() +
+  scale_fill_manual(
+    values = c("0–149" = "steelblue", "150–349" = "orange", "350+" = "tomato"),
+    na.value = "grey80",
+    drop = FALSE
+  ) +
+  labs(
+    title = "Figure 3: Listings by Price Range",
+    x = "Price Range (AUD)",
+    y = "Number of Listings",
+    fill = "Price range"
+  ) +
+  theme_minimal(base_size = 13)
+
+#Plot Figure 4: histogram showing overall price distribution
+price_distribution <- ggplot(df, aes(x = price_num)) +
+  geom_histogram(bins = 60, alpha = 0.9, fill = "steelblue") +
+  labs(title = "Figure 4: Price Distribution", x = "Price (AUD)", y = "Count") +
+  theme_minimal(base_size = 13)
+
+#display both plots
+listing + price_distribution
+
+```
+
+The bar chart and histogram provide a clear visual representation of the market’s price structure. The histogram, Figure 4, is extremely right-skewed, with the vast majority of properties falling between $150 and $349 per night, as represented in the bar chart in Figure 3. This suggests the Sydney market is primarily driven by mid-range listings, with moderate representation from budget listings. In addition, the long tail of the distribution in the histogram corresponds to a relatively small number of high end luxury properties (350+), the rates for which can exceed several thousand dollars per night. This bias is an important property to take into account in any price prediction model.
+
+```{r geo, fig.pos='H'}
+
+df <- df %>%
+  mutate(
+    price_band = case_when(
+      price_num < 150 ~ "0–149",
+      price_num < 350 ~ "150–349",
+      TRUE ~ "350+"
+    )
+  ) %>%
+  # Ensure legend order
+  mutate(price_band = factor(price_band, levels = c("0–149", "150–349", "350+")))
+
+pal <- colorFactor(
+  palette = c("steelblue", "orange", "tomato"),
+  domain = df$price_band
+)
+
+# Map
+df %>%
+  leaflet() %>%
+  addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+  setView(lng = 151.15, lat = -33.85, zoom = 10) %>%
+  addCircleMarkers(
+    ~longitude, ~latitude,
+    color = ~pal(price_band),
+    radius = 2, stroke = FALSE, fillOpacity = 0.8,
+    popup = ~paste0("<b>", id, "</b><br>Price: $", price_num)
+  ) %>%
+  addLegend(
+    "bottomright", pal = pal, values = ~price_band,
+    title = "Price Range (AUD)", opacity = 1
+  ) %>%
+  addControl(
+    html = "<div style='font-size:14px; font-weight:600; margin:0; padding:0;'>Figure 5: Sydney Listings by Price Range</div>",
+    position = "topright"
+  )
+
+```
+
+Figure 5, the geographic map, shows the importance of location in a product’s price. Properties are heavily concentrated around Sydney CBD, Eastern Suburbs and Lower North Shore listings. A clear trend can be seen with the priciest dwellings (‘350+’ as red dots) clustered in high-end suburbs, particularly along the coastlines and near the harbour. This visualisation suggests that predictors based on location (i.e., latitude and longitude) are critical to price.
+
+```{r final-layout, fig.width=12, fig.height=5, message=FALSE, warning=FALSE, fig.cap="Table 1 presents the top 10 features most strongly correlated with price, while Figure 6 illustrates the price distribution by number of bathrooms."}
+
+#Correlation table
+num_for_cor <-
+  df |>
+  select(where(is.numeric)) |>
+  select(-id, -host_id)
+
+cor_mat <- cor(num_for_cor, use = "pairwise.complete.obs")
+
+price_cor <-
+  cor_mat[, "price_num"] |>
+  sort(decreasing = TRUE) |>
+  as.data.frame() |>
+  rownames_to_column("feature") |>
+  rename(corr = 2) |>
+  filter(feature != "price_num") |>
+  slice_head(n = 10)
+
+#Bathroom plot
+cap_hi_bath <- 7
+
+df_box_bathrooms <- df %>%
+  filter(!is.na(bathrooms), !is.na(price_num)) %>%
+  filter(bathrooms > 0, bathrooms <= cap_hi_bath)
+
+plot_bathrooms <- 
+  ggplot(df_box_bathrooms, aes(x = factor(bathrooms), y = price_num, fill = factor(bathrooms))) +
+  geom_boxplot(outlier.alpha = 0.25, width = 0.6, show.legend = FALSE) +
+  stat_summary(fun = median, geom = "point", shape = 95, size = 6, color = "black") +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Figure 6: Price distribution by number of bathrooms", x = "Number of Bathrooms", y = "Price (AUD)") +
+  theme_minimal(base_size = 13)
+
+
+price_cor_rounded <- price_cor %>%
+  mutate(corr = round(corr, 3))
+
+table_cor <- tableGrob(price_cor_rounded)
+
+plot_grid(table_cor, plot_bathrooms, ncol = 2, rel_widths = c(0.8, 1.2))
+
+```
+The correlation table and boxplot (Figure 6) corroborate in that physical amenities have the most noticeable effects on price. Table 1 reveals bathrooms, bedrooms, and accommodates (number of guests) are among the features with the highest positive correlation to price.
+
+This trend is visually confirmed by the boxplot of bathrooms, where a stepwise elevation in median price is observed from one bathroom through seven bathrooms with increasing spread at each level. That reveals an intuitive and predictable relationship: the more bathrooms a listing has, the more expensive it is.
+
+In conclusion, the dataset enables several visualisations that highlight key patterns.
+
+# 5. Data Preprocessing
+
+The next steps complete the data preparation process, ensuring the dataset is clean, balanced, and ready for training machine learning models.
+
+The other remaining missing values were addressed using the robust, non-parametric missForest algorithm. This approach was chosen because it uses the strengths of the random forest model, in that it takes observed values in other features in the dataset to pool together and iteratively develop predictions for the missing values. This way of imputing is also more reliable, and will ultimately yield more accurate estimates than simply replacing the missing value with the median or mean. Before applying the imputation method, date features were converted to numeric and Boolean features were transferred to be integers (0/1). This created the complete dataset (df_complete). No missing data has been present post imputation.
+
+```{r impute, cache=TRUE}
+#Define column groups by type
+logical_cols <- c("host_is_superhost", "host_has_profile_pic",
+                  "host_identity_verified", "has_availability",
+                  "instant_bookable")
+
+date_cols <- c("host_since", "first_review", "last_review")
+
+high_card_cols <- c("neighbourhood_cleansed", "property_type",
+                    "room_type", "host_response_time")
+
+#Handle missing character entries
+df <- df %>%
+  mutate(across(where(is.character), ~ ifelse(. == "", "missing", .)))
+
+#Convert logical columns to numeric
+df <- df %>% mutate(across(all_of(logical_cols), as.integer))
+
+#Convert dates into numeric format
+df <- df %>%
+  mutate(across(all_of(date_cols), ~ as.numeric(as.Date(.) - as.Date("2000-01-01"))))
+
+#Convert character columns to factors
+df <- df %>% 
+  mutate(across(where(is.character), as.factor))
+
+#Reduce high-cardinality categorical levels
+df <- df %>%
+  mutate(across(all_of(high_card_cols), ~ fct_lump_n(., n = 20, other_level = "other")))
+
+#Impute missing values using missForest
+set.seed(123)
+imputed <- missForest(
+  df, 
+  maxiter = 1,     
+  verbose = FALSE 
+)
+
+#Extract imputed dataset and report results
+df_complete <- imputed$ximp
+
+#cat("\nMissing values after missForest imputation:\n")
+```
+
+Subsequently, One-Hot Encoding (OHE) was applied to the high-cardinality categorical features, namely neighbourhood_cleansed, property_type, and room_type, for the next round of numerical analysis. OHE is a method that converts each unique category into a new binary (0 or 1) column, which is necessary to convert these features into numerical only since every feature for the upcoming PCA analysis must be numeric. Next, both the original categorical columns and the bathrooms_text helper column were dropped to complete the features, resulting in a high dimensional, fully numerical matrix.
+
+```{r}
+#Create a preprocessing recipe for all columns, then dummy only the specified ones.
+rec <- recipe(df_complete) %>%
+  update_role(everything(), new_role = "predictor") %>% 
+  step_dummy(
+    all_nominal_predictors(), #Automatically finds all factor columns
+    one_hot = TRUE 
+  )
+
+#Prepare and apply the recipe
+df_final <- prep(rec) %>%
+  bake(new_data = NULL) #new_data = NULL: indicates the same data used during recipe preparation"
+
+```
+
+The comprehensive preprocessing pipeline was constructed utilising the "recipes" framework of the tidymodels framework. This is an important step to ensure the same data transformation is utilised each time the model is trained and modelled. In this case, the recipe consisted of four key steps: Normalisation (centring and scaling numeric features, which is required prior to PCA), performed PCA to reduce dimensionality while retaining 95% of the variance, removed the price_band variable that was a duplicate, and performed SMOTE to counter the observed class imbalance in the dependent variable or target variable.
+
+```{r smote-recipe, cache=TRUE}
+#replace empty strings in character columns
+df_complete <- df_complete %>%
+  mutate(across(where(is.character), ~ ifelse(. == "", "missing", .)))
+
+#Build preprocessing recipe for modelling
+#1. Uses 'price_category' as the target variable
+#2. Removes 'price_band' (redundant variable)
+#3. Normalises all numeric predictors
+#4. Applies PCA to numeric features, keeping 95% of the variance
+#5. Converts categorical predictors to one-hot encoded variables
+#6. Balances the target classes using SMOTE oversampling
+
+rec <- recipe(price_category ~ ., data = df_complete) %>%
+  
+  step_rm(price_band) %>%
+  
+  step_normalize(all_numeric_predictors()) %>%
+  
+  step_pca(all_numeric_predictors(), threshold = 0.95) %>%
+  
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  
+  step_smote(price_category, over_ratio = 1, neighbors = 5)
+
+#Apply preprocessing
+rec_prep <- prep(rec)
+df_final <- bake(rec_prep, new_data = NULL)
+```
+
+```{r class_imbalance_results function, include = FALSE}
+# Helper: recode any historical labels to the new bins
+recode_price_cat <- function(x) {
+  x <- as.character(x)
+  dplyr::recode(
+    x,
+    # old numeric labels
+    "0–149" = "0-150", "0-149" = "0-150", "0–199" = "0-150", "0-199" = "0-150",
+    "150–349" = "150-350", "150-349" = "150-350", "150–350" = "150-350",
+    "200–399" = "150-350", "200-399" = "150-350",
+    "350+" = "350+", "400+" = "350+",
+    # semantic labels -> new bins
+    "Budget" = "0-150", "Mid-range" = "150-350", "Luxury" = "350+",
+    .default = x
+  )
+}
+```
+
+```{r class_imbalance_results, fig.width=14, fig.height=6, fig.cap=" Figure 7 (left): Class balance before and after SMOTE. Table 2 (right): Class counts"}
+
+
+#Target levels in the desired order
+lvl <- c("0-150", "150-350", "350+")
+
+#Align categories for before/after datasets
+before <- factor(recode_price_cat(df_complete$price_category), levels = lvl)
+after  <- factor(recode_price_cat(df_final$price_category),    levels = lvl)
+
+#Counts for plot
+before_counts <- as.data.frame(table(before), stringsAsFactors = FALSE)
+names(before_counts) <- c("Category", "Count")
+before_counts$Step <- "Before SMOTE"
+
+after_counts <- as.data.frame(table(after), stringsAsFactors = FALSE)
+names(after_counts) <- c("Category", "Count")
+after_counts$Step <- "After SMOTE"
+
+balance_data <- rbind(before_counts, after_counts)
+
+#Plot
+plot_balance <- ggplot(balance_data, aes(x = Category, y = Count, fill = Step)) +
+  geom_col(position = "dodge") +
+  scale_x_discrete(limits = lvl) +  # enforce new order/labels
+  labs(
+    title = "Figure 7: Class Balance Before and After SMOTE",
+    x = "Price Category",
+    y = "Number of Listings"
+  ) +
+  theme_minimal(base_size = 14)
+
+#Table (build directly with aligned factors; no rename needed)
+balance_table <- rbind(
+  "Before SMOTE" = table(before),
+  "After SMOTE"  = table(after)
+)
+
+balance_table_df <- as.data.frame.matrix(balance_table)
+balance_table_df <- tibble::rownames_to_column(balance_table_df, "Step")
+
+#Styling and side-by-side display
+tg_theme <- ttheme_default(
+  base_size = 10,
+  core = list(bg_params = list(fill = c("grey95", "white"))),
+  colhead = list(fg_params = list(col = "black", fontface = "bold")),
+  rowhead = list(fg_params = list(col = "black", fontface = "bold"))
+)
+
+table_grob <- tableGrob(balance_table_df, rows = NULL, theme = tg_theme)
+
+plot_balance + table_grob
+
+```
+
+# 6. Modelling
+
+A rigorous evaluation and comparison framework involving Nested Cross-Validation was implemented to determine the best-performing model for predicting price_category. Nested Cross-Validation was chosen deliberately to ensure that optimistic performance bias, which can result from using regular Cross-Validation, is avoided. As a result, the final performance measures are a true, unbiased estimate of how each model will perform when used on new or unseen data. 
+
+The model-building process was organised as a nested two-loop structure. The data was first divided into 4 outer folds which will result in the final unbiased evaluation of the best-tuned version of each model. Next, for each of the outer loops, the 75% training split (k-1 folds) was subjected to a further split of the data into 3 inner folds. The inner folds were then used to hyperparameter tune each of the five candidate models which included Elastic Net (GLM), Random Forest (Ranger), XGBoost, K-Nearest Neighbours (KNN), and Support Vector Machine (SVM). The best hyperparameter results for each model were evaluated based on the highest accuracy achieved during the inner loops. Finally, the best-tuned model was re-trained on the full outer fold training set and evaluated once on the 25% outer fold test set (1 fold).
+
+This entire nested process was performed 4 times for each of the outer 4 folds. The average of the performance metrics expressed in the results section was taken, which resulted in the 4 outer folds evaluation scores and the average scores of those 4 folds will be discussed in the results section. The hyperparameters grid and number of folds were adjusted to reduce the computational time.
+
+
+```{r model-implementation, eval = FALSE}
+
+df_model <- df_final 
+
+set.seed(42)
+
+#--- MODEL SPECIFICATIONS ---
+
+#1. Elastic Net (GLM)
+glm_spec <- multinom_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+#2. Random Forest
+rf_spec <- rand_forest(mtry = tune(), trees = 500, min_n = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+#3. XGBoost
+xgb_spec <- boost_tree(trees = 500, learn_rate = tune(), tree_depth = tune(), min_n = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+#4. K-Nearest Neighbors (KNN)
+knn_spec <- nearest_neighbor( neighbors = tune(), weight_func = tune()
+) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+#5. Support Vector Machine (SVM)
+svm_spec <- svm_rbf( cost = tune(), rbf_sigma = tune()
+) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+
+#--- WORKFLOWS ---
+rf_wf  <- workflow() |> add_model(rf_spec)  |> add_formula(price_category ~ .)
+glm_wf <- workflow() |> add_model(glm_spec) |> add_formula(price_category ~ .)
+xgb_wf <- workflow() |> add_model(xgb_spec) |> add_formula(price_category ~ .)
+knn_wf <- workflow() |> add_model(knn_spec) |> add_formula(price_category ~ .)
+svm_wf <- workflow() |> add_model(svm_spec) |> add_formula(price_category ~ .)
+
+#--- GRIDS  ---
+glm_grid <- grid_regular(penalty(), mixture(), levels = 2)
+
+rf_grid  <- grid_regular(mtry(range = c(5, 15)), min_n(range = c(5, 20)), levels = 2)
+
+xgb_grid <- grid_regular(
+  learn_rate(range = c(0.01, 0.3)), 
+  tree_depth(range = c(3, 9)), 
+  min_n(range = c(5, 20)), 
+  levels = 2
+)
+
+knn_grid <- grid_regular(
+  neighbors(range = c(3, 15)), 
+  weight_func(values = c("rectangular", "triangular")), 
+  levels = 2
+)
+
+svm_grid <- grid_regular(
+  cost(range = c(-2, 2), trans = log10_trans()), 
+  rbf_sigma(range = c(-2, 2), trans = log10_trans()), 
+  levels = 2
+)
+
+#--- METRICS SET ---
+metrics <- metric_set(
+  accuracy, 
+  mn_log_loss, 
+  precision, 
+  recall, 
+  f_meas, 
+  roc_auc
+)
+
+#--- PARALLEL SETUP ---
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+#--- OUTER CV ---
+outer_folds <- vfold_cv(df_model, v = 4, strata = price_category)
+outer_results <- list()
+
+
+tune_ctrl <- control_grid(save_pred = TRUE, save_workflow = TRUE, verbose = TRUE)
+last_ctrl <- control_last_fit(metrics = metrics)
+
+for (i in seq_along(outer_folds$splits)) {
+  cat("\n===== Outer fold:", i, "=====\n")
+
+  split_outer <- outer_folds$splits[[i]]
+  train_outer <- analysis(split_outer)
+  test_outer  <- assessment(split_outer)
+
+  #Inner folds
+  inner_folds <- vfold_cv(train_outer, v = 3, strata = price_category)
+
+  #---- Tune RF ----
+  rf_tune_results <- tune_grid(
+    rf_wf,
+    resamples = inner_folds,
+    grid = rf_grid,
+    metrics = metrics,
+    control = tune_ctrl
+  )
+
+  #---- Tune GLMNET ----
+  glm_tune_results <- tune_grid(
+    glm_wf,
+    resamples = inner_folds,
+    grid = glm_grid,
+    metrics = metrics,
+    control = tune_ctrl
+  )
+
+  #---- Tune XGBoost ----
+  xgb_tune_results <- tune_grid(
+    xgb_wf,
+    resamples = inner_folds,
+    grid = xgb_grid,
+    metrics = metrics,
+    control = tune_ctrl
+  )
+
+  #---- Tune KNN ----
+  knn_tune_results <- tune_grid(
+    knn_wf,
+    resamples = inner_folds,
+    grid = knn_grid,
+    metrics = metrics,
+    control = tune_ctrl
+  )
+
+  #---- Tune SVM ----
+  svm_tune_results <- tune_grid(
+    svm_wf,
+    resamples = inner_folds,
+    grid = svm_grid,
+    metrics = metrics,
+    control = tune_ctrl
+  )
+
+  #---- Select best based on Accuracy ----
+  rf_best  <- select_best(rf_tune_results,  metric = "accuracy")
+  glm_best <- select_best(glm_tune_results, metric = "accuracy")
+  xgb_best  <- select_best(xgb_tune_results,  metric = "accuracy")
+  knn_best  <- select_best(knn_tune_results,  metric = "accuracy")
+  svm_best  <- select_best(svm_tune_results,  metric = "accuracy")
+
+  # ---- Finalise workflow ----
+  rf_final_wf  <- finalize_workflow(rf_wf,  rf_best)
+  glm_final_wf <- finalize_workflow(glm_wf, glm_best)
+  xgb_final_wf <- finalize_workflow(xgb_wf, xgb_best)
+  knn_final_wf <- finalize_workflow(knn_wf, knn_best)
+  svm_final_wf <- finalize_workflow(svm_wf, svm_best)
+
+  #---- Evaluate on outer test ----
+  rf_last  <- last_fit(rf_final_wf, split_outer, metrics = metrics, control = last_ctrl)
+  glm_last <- last_fit(glm_final_wf, split_outer, metrics = metrics, control = last_ctrl)
+  xgb_last <- last_fit(xgb_final_wf, split_outer, metrics = metrics, control = last_ctrl)
+  knn_last <- last_fit(knn_final_wf, split_outer, metrics = metrics, control = last_ctrl)
+  svm_last <- last_fit(svm_final_wf, split_outer, metrics = metrics, control = last_ctrl)
+
+  #Collect and bind metrics for this fold
+  rf_metrics  <- collect_metrics(rf_last)  |> mutate(model = "ranger", outer_fold = i)
+  glm_metrics <- collect_metrics(glm_last) |> mutate(model = "glmnet", outer_fold = i)
+  xgb_metrics <- collect_metrics(xgb_last) |> mutate(model = "xgboost", outer_fold = i)
+  knn_metrics <- collect_metrics(knn_last) |> mutate(model = "kknn", outer_fold = i)
+  svm_metrics <- collect_metrics(svm_last) |> mutate(model = "svm_rbf", outer_fold = i)
+
+  outer_results[[i]] <- bind_rows(rf_metrics, glm_metrics, xgb_metrics, knn_metrics, svm_metrics)
+  print(outer_results[[i]])
+}
+
+stopCluster(cl)
+
+#--- AGGREGATE RESULTS ---
+all_outer <- bind_rows(outer_results)
+
+summary_outer <- all_outer |>
+  group_by(model, .metric) |>
+  summarise(
+    mean  = mean(.estimate, na.rm = TRUE),
+    sd    = sd(.estimate,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n==== Nested CV Summary ====\n")
+print(summary_outer)
+
+# --- SAVE RESULTS ---
+write_rds(summary_outer, "nested_cv_summary.rds")
+write_rds(all_outer, "nested_cv_all_folds.rds")
+
+```
+
+```{r load-results, include = FALSE}
+summary_outer <- read_rds("nested_cv_summary.rds")
+all_outer <- read_rds("nested_cv_all_folds.rds")
+```
+
+# 7. Results Visualised
+
+The nested cross-validation process provided a robust comparison of the five candidate models. The table and plots below illustrate the mean performance and stability of each model across the key classification metrics.
+
+```{r boxplots, fig.width=11, fig.height=5}
+
+#Extract accuracy results from the nested cross-validation
+accuracy_summary <- summary_outer |>
+  filter(.metric == "accuracy")
+
+## Create a bar plot of mean model accuracy with error bars
+plot_bar_summary <- ggplot(accuracy_summary, aes(x = model, y = mean, fill = model)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    width = 0.2,
+    position = position_dodge(0.9)
+  ) +
+  labs(
+    title = "Figure 8: Mean Model Accuracy",
+    subtitle = "Error bars show +/- 1 standard deviation",
+    x = "Model",
+    y = "Mean Accuracy"
+  ) +
+  theme_minimal(base_size = 10) + 
+  theme(legend.position = "none") 
+
+#Extract accuracy estimates from all outer folds (for boxplot visualisation)
+accuracy_all_folds <- all_outer |>
+  filter(.metric == "accuracy")
+
+#Create a boxplot showing the distribution of accuracy across outer folds
+plot_box_dist <- ggplot(accuracy_all_folds, aes(x = model, y = .estimate, fill = model)) +
+  geom_boxplot() +
+  labs(
+    title = "Figure 9: Distribution of Model Accuracy",
+    subtitle = "Each boxplot built from 4 outer folds",
+    x = "Model",
+    y = "Accuracy"
+  ) +
+  theme_minimal(base_size = 10) + 
+  theme(legend.position = "none") 
+
+#Combine Plots
+plot_bar_summary + plot_box_dist
+
+```
+
+Figure 8 provides a high-level summary of performance. It displays the average accuracy of each model across the 4 outer folds, with error bars representing one standard deviation. This gives a clear view of the average performance and its consistency.
+
+Figure 9 offers a more detailed and robust view of model stability. Instead of just the mean, it shows the full distribution of accuracy scores from each of the 4 outer folds in boxplots, giving a much clearer picture of how variable each model's performance was.
+
+Finally, the summary table below provides the precise mean and standard deviation (in brackets) for all six classification metrics, pivoted for easy comparison.
+
+```{r table-summary-wide-styled,fig.align = "center",fig.width=8, fig.height=3}
+
+## Create a wide-format summary table showing model performance (Mean ± SD)
+summary_wide <- summary_outer |>
+  mutate(
+    performance_str = paste0(
+      sprintf("%.3f", mean),   
+      " (±", 
+      sprintf("%.3f", sd),     
+      ")"
+    )
+  ) |>
+  select(model, .metric, performance_str) |>
+  pivot_wider(
+    names_from = model,          
+    values_from = performance_str  
+  ) |>
+  rename(Metric = .metric)
+
+#Display the formatted summary table as HTML using knitr::kable
+kable(
+  summary_wide,
+  caption = "Table 3: Nested CV Performance Summary (Mean ± Standard Deviation)",
+  format = "html"  
+) |>
+  kable_styling(
+    bootstrap_options = "bordered", 
+    full_width = FALSE              
+  )
+```
+
+# 8. Interpretation of results
+
+The aggregate performance values found in the table above show unambiguous differences between the models. In order to understand the significance of these results, it is useful to think about the values and the mechanisms of the models. The main values are Accuracy (overall percentage of accurate predictions), F-Measure (a balanced measure of precision and recall), and ROC AUC (the Area Under the ROC Curve, a measure of how well the model separates the classes, where 1.0 is perfect).  
+
+The Support Vector Machine (SVM) with a RBF kernel was the clear winner. It had a higher mean performance in every metric than any other model. In fact, it had an Accuracy of 0.935 (±0.001) and a near perfect ROC AUC of 0.991 (±0.000). These results are explained directly by the mechanism in SVM, which seeks a max-margin hyperplane between classes. The RBF kernel in particular was able to map the high dimensional feature space created through PCA and OHE, effectively finding a complicated non-linear solution that the other models were unable to find. Additionally, the very low standard deviation supports that the accuracy was both high and stable and reliable.
+
+The Random Forest (ranger) model was the second best performing model, indicating strong classification ability at a mean accuracy of 0.912 (±0.005). Being an ensemble of decision trees, it can capture non-linear relationships and complex interactions between features, which are typically all good signs of potentially higher scores. However, it did not provide any greater separation than the SVM. 
+
+Next, the XGBoost and GLMNet model performed solidly at the mid-level. GLMNet does a good job at developing strong linear boundaries as it uses both L1 and L2 regularisation (Elastic Net) which help lower any overfitting and pick features. Its ROC AUC of 0.981 is quite respectable to be able to separate classes well, but due to how GLMNet ranked comparatively to the SVM, this may indicate that the problem is not able to be modelled perfectly linearly. XGBoost, an ensemble that achieved similar separation/performance as GLMNet also seems to have similar potential. However, the small tuning grid may have prevented XGBoost from reaching its full potential, and further tuning could improve its performance.
+
+
+Afterwards, the K-Nearest Neighbours (KNN) model was clearly the weakest performer, with a mean Accuracy of just 0.757 (±0.006) and it is easy to understand why. KNN is a basic and simple non-parametric learning algorithm that relies on the "locality" of neighbours combined with the known values for the neighbours. In this sense, distance measures will continue to deteriorate in reliability as dimensionality increases, an issue frequently referred to as the 'curse of dimensionality'. This still applies after PCA, because the reduced space after PCA is still high dimensional. Furthermore, coupled with what are evidently complex and overlapping class borders, the simple KNN algorithm had difficulty finding a reliable predictive pattern.
+
+In conclusion, based on the analysis, the SVM (RBF) model is the suggested option for this classification problem. The SVM model was aided by its superior model performance with great stability, thus making it the best choice with regard to reliability and effectiveness for this model application. Additionally, the strong performance in the Random Forest model versus the poor performance in KNN shows something about the underlying relationships that most likely exist, which are likely to be complex and non-linear relationships, explaining why the SVM and tree-based ensemble methods performed well and KNN, the most straightforward and simple learning algorithm did not.
+
+# 9. Final Model
+To finalise, a confusion matrix was generated for the SVM using the best hyperparameters from tuning (cost = 100 and rbf_sigma = 0.01; these correspond to both the upper and lower endpoints of the tuned grid). A stratified 80/20 split was formed. The preprocessing recipe (normalisation, PCA, one-hot encoding, and SMOTE) was only estimated on the training data, to avoid data leakage, before application to the test data. The SVM was trained on the preprocessed training data set and subsequently evaluated once, on the untouched test set, and the results reported in the confusion matrix.
+
+```{r svm_final_fit_confmat, message=FALSE, warning=FALSE, cache=TRUE}
+
+set.seed(2025)
+
+#Ensure outcome is a factor and do an 80/20 stratified split
+df_complete <- df_complete %>% mutate(price_category = factor(price_category))
+split <- initial_split(df_complete, prop = 0.80, strata = price_category)
+train <- training(split)
+test  <- testing(split)
+
+#Same modelling recipe only applied for training dataset. NOT for testing.
+rec_final <- recipe(price_category ~ ., data = train) %>%
+  step_rm(any_of("price_band")) %>%                       # safe if column missing
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = 0.95) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_smote(price_category, over_ratio = 1, neighbors = 5)
+
+#Final SVM with best hyperparameters
+svm_spec_final <- svm_rbf(cost = 100, rbf_sigma = 0.01) %>%  # from svm_best
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+wf_final <- workflow() %>%
+  add_model(svm_spec_final) %>%
+  add_recipe(rec_final)
+
+#Fit once on train; evaluate once on the untouched 20% test
+svm_last <- last_fit(wf_final, split)
+
+#Get predictions on the 20 percent test set
+svm_preds <- collect_predictions(svm_last) %>%
+  mutate(
+    price_category = as.character(price_category),
+    .pred_class    = as.character(.pred_class)
+  )
+
+```
+
+
+```{r confusion matrix, fig.width=10, fig.height=4}
+
+#Desired order
+ord <- c("0-149", "150-349", "350+")
+
+#Normalise dashes (– → -)
+fix_band <- function(x) str_replace_all(as.character(x), "\u2013", "-")
+
+#Build the confusion-matrix data frame
+cm_df <- svm_preds %>%
+  count(Truth = price_category, Prediction = .pred_class, name = "n") %>%
+  mutate(
+    Truth      = fix_band(Truth),
+    Prediction = fix_band(Prediction),
+    Truth      = factor(Truth,      levels = ord),
+    Prediction = factor(Prediction, levels = ord)
+  ) %>%
+  #Fill missing combinations with zeros
+  complete(Truth, Prediction, fill = list(n = 0))
+
+#Plot
+p_counts <- ggplot(cm_df, aes(x = Truth, y = Prediction, fill = n)) +
+  geom_tile(color = "grey70", size = 0.4) +
+  geom_text(
+    aes(label = format(n, big.mark = ",")),
+    size = 4, colour = "black"
+  ) +
+  scale_fill_gradient(
+    low = "white", high = "steelblue",
+    limits = c(0, max(cm_df$n)),
+    breaks = pretty_breaks(4),
+    name = "Count"
+  ) +
+  scale_x_discrete(position = "bottom", name = "Truth") +
+  scale_y_discrete(limits = rev(ord), name = "Prediction") +
+  coord_fixed() +
+  labs(
+    title = "Figure 10: Confusion Matrix — SVM RBF (80/20 hold-out)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text = element_text(colour = "black"),
+    plot.title = element_text(
+      hjust = 0.5,          # centre the title
+      size = 14
+    )
+  )
+
+p_counts
+
+```
+The confusion matrix highlights that the SVM with RBF kernel results in strong and balanced classification overall for all three price categories. The mid-range price class (150 to 349 AUD) was predicted with notably high accuracy at 1,454 out of 1,643 listings, which suggests the model is able to reliably learn the most dominant price class. The budget price class (0 to 149 AUD) was also predicted with accuracy (804 correctly predicted) and had limited confusion into the mid-range price class. The luxury price class (350+ AUD) was predicted with 1,030 precision, but demonstrated some overlap with the mid range price class (56 misclassified), indicating that higher priced listings present some ambiguity which may influence the misclassifications. Overall, the misclassifications are primarily within the adjacent price range, rather than extreme categories. These results reinforce that the model is successful in learning price structure, and that most of the remaining misclassification aligns with natural overlaps in the market.
+
+# 10. Conclusion
+
+This research managed to build a strong classification model for Sydney Airbnb listings based on price. After a robust preprocessing process including imputation, dimensionality reduction (PCA), and even class balance method (SMOTE), Nested Cross-Validation was utilised to baseline five different models. 
+The Support Vector Machine (SVM) with RBF kernel came out on top of the five models, demonstrating a very clear improvement over all others, and the SVM provided a very strong and stable accuracy of 0.935 (± 0.001).
+
+Some limitations of this study involved the computational expense of processing as well as no hyper-parameter tuning during the evaluation period. For future work, different hyperparameter tuning modifications can be examined, and Natural Language Processing (NLP) can also be included on the text based features (amenity, description), which could lead to enhanced predictive ability. In addition, GPU processing would be a key asset to reduce computational time and, consequently, enable a broader grid of hyperparameters to be explored.
+
+# 11. Appendix
+## References  
+- The Smartest Way To Optimize Your Short-Term Rentals. (n.d.). Airbtics | Airbnb Analytics. https://airbtics.com/
+- CBRE. (2024). Hotels Australia – Overview & Outlook 2024. CBRE Australia. https://mktgdocs.cbre.com/2299/7640bfca-0bfc-4331-ba03-47c998be1cfb-2549878428/v032024/hotels-australia-overview-and-outlook-2024.pdf
+- Inside Airbnb. (2025). Get the Data.https://insideairbnb.com/get-the-data/
+- Machine Learning Crash Course  |  Google Developers. (2019). Google Developers. https://developers.google.com/machine-learning/crash-course
